@@ -1,4 +1,3 @@
-
 #include <sr595.h>
 #include <stdio.h>
 #include <wiringPi.h>
@@ -126,14 +125,19 @@ int main(void) {
     delayMicroseconds(DWELL);
     digitalWrite(100 + 8, 0);
 
+    // get the status of NTP for the lock LED
+    interfaceUnion.interface.upper = BLANKING;
+
+    int locked=system("ntpstat 2>&1 > /dev/null");
+    if (locked==0) { // anything but zero is unlocked....
+      interfaceUnion.interface.upper |= LOCK;
+    }
+
     // set the : to toggle every second
     if (sl & 1) {
-      interfaceUnion.interface.upper = LOCK | BLANKING | DOTS;
-      // printf ("on\n");
-    } else {
-      interfaceUnion.interface.upper = LOCK | BLANKING;
-      // printf("off\n");
+      interfaceUnion.interface.upper |= DOTS;
     }
+
     interfaceUnion.interface.lower = 0;
     node->data3 = interfaceUnion.data;
     digitalWrite(100 + 12, 1);
