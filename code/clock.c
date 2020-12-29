@@ -93,7 +93,7 @@ int main(void) {
     hh = hours / 10;
 
     //    printf ("%s h=%i%i m=%i%i s=%i%i\n",t,hh,hl,mh,ml,sh,sl);
-#define DWELL 5000
+#define DWELL 8000
 
     // send seconds
     interfaceUnion.interface.lower = sl;
