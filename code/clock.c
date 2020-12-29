@@ -62,6 +62,10 @@ int main(void) {
     return -1;
   }
 
+
+  int oldSl=-1, oldSh=-1; // used to detect a new led update period...
+  int locked; // set to zero when NTP is locked
+
   for (;;) {
     time_t now = time(NULL);
 
@@ -125,23 +129,34 @@ int main(void) {
     delayMicroseconds(DWELL);
     digitalWrite(100 + 8, 0);
 
-    // get the status of NTP for the lock LED
-    interfaceUnion.interface.upper = BLANKING;
 
-    int locked=system("ntpstat 2>&1 > /dev/null");
-    if (locked==0) { // anything but zero is unlocked....
-      interfaceUnion.interface.upper |= LOCK;
+    // only do this once a second....
+    if (oldSl!=sl) {
+      oldSl=sl;
+
+      // only do this once every 10 seconds....
+      if (oldSh!=sh) {
+        oldSh=sh;
+        // get the status of NTP for the lock LED
+        locked=system("ntpstat 2>&1 > /dev/null");
+      }
+
+      interfaceUnion.interface.upper = BLANKING;
+
+      if (locked==0) { // anything but zero is unlocked....
+        interfaceUnion.interface.upper |= LOCK;
+      }
+
+      // set the : to toggle every second
+      if (sl & 1) {
+        interfaceUnion.interface.upper |= DOTS;
+      }
+
+      interfaceUnion.interface.lower = 0;
+      node->data3 = interfaceUnion.data;
+      digitalWrite(100 + 12, 1);
+      digitalWrite(100 + 12, 0); // toggle the e bit to load the latch
+      }
     }
-
-    // set the : to toggle every second
-    if (sl & 1) {
-      interfaceUnion.interface.upper |= DOTS;
-    }
-
-    interfaceUnion.interface.lower = 0;
-    node->data3 = interfaceUnion.data;
-    digitalWrite(100 + 12, 1);
-    digitalWrite(100 + 12, 0); // toggle the e bit to load the latch
-  }
   return 0;
 }
