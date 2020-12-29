@@ -32,3 +32,16 @@ sudo apt-get install wiringpi
 7. clone the repository
 
 8. kick off make.sh
+
+9. add quality of ntp to contol the front panel led
+sudo apt-get install ntpstat
+
+optional:
+1) make filesystem read only:
+
+--- run this script:
+https://learn.adafruit.com/read-only-raspberry-pi/overview
+
+--- modify ntp:
+https://unix.stackexchange.com/questions/553930/ntp-wont-work-on-read-only-raspberry-pi
+
