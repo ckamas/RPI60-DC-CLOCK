@@ -1,9 +1,9 @@
-#include <sr595.h>
+#include <lgpio.h>
 #include <stdio.h>
-#include <wiringPi.h>
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/timex.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -11,8 +11,75 @@
 #define DOTS 8
 #define LOCK 1
 
+#define GPIOCHIP 0 // /dev/gpiochip0 (the 40-pin header on all Pi models)
+
+// 74HC595 chain: Broadcom GPIO pins 10, 11 & 8 for data, clock and latch
+#define SR_DATA 10
+#define SR_CLOCK 11
+#define SR_LATCH 8
+#define SR_BITS 32
+
+// Bit positions in the 32-bit shift register image that are toggled directly.
+// They must match the bitfield layout of interfaceUnion in main(); main()
+// verifies that at startup.
+#define SR_BIT_BLANKING 8  // == interface.blanking
+#define SR_BIT_LATCH_U3 12 // == interface.latchU3
+
+// back-panel offset encoder: pin 1 = gnd, pins 2-5 = gpio 21,20,16,12
+static const int ENC_PINS[4] = {21, 20, 16, 12};
+
+static int chip = -1;          // lgpio gpiochip handle
+static uint32_t srOutput = 0;  // shadow of the shift register contents
+
+// Shift all SR_BITS out MSB first, then rising edge on latch.
+// (same behaviour as wiringPi's sr595 driver this replaces)
+static void srShift(void) {
+  lgGpioWrite(chip, SR_LATCH, 0);
+  for (int bit = SR_BITS - 1; bit >= 0; --bit) {
+    lgGpioWrite(chip, SR_DATA, (srOutput >> bit) & 1);
+    lgGpioWrite(chip, SR_CLOCK, 1);
+    lgGpioWrite(chip, SR_CLOCK, 0);
+  }
+  lgGpioWrite(chip, SR_LATCH, 1);
+}
+
+// set/clear one bit of the shift register image and push it out
+static void srWriteBit(int bit, int value) {
+  if (value)
+    srOutput |= (1u << bit);
+  else
+    srOutput &= ~(1u << bit);
+  srShift();
+}
+
+// Is the system clock synchronised?  Returns 0 when locked, non-zero otherwise
+// (same convention ntpstat used).
+//
+// chronyd publishes its state to the kernel (it clears STA_UNSYNC once it is
+// synchronised; this needs "rtcsync" in chrony.conf, which setup.sh enforces).
+// Reading it with ntp_adjtime(modes=0) is a cheap, read-only syscall, so we
+// don't have to fork a process and stall the display refresh.
+static int clockUnlocked(void) {
+  struct timex tx = {0}; // modes == 0: query only, changes nothing
+  int state = ntp_adjtime(&tx);
+  return (state >= 0 && state != TIME_ERROR) ? 0 : 1;
+}
+
+// Read the 4-bit back-panel offset encoder (switches pull to ground).
+// Returns `previous` if any pin can't be read, rather than a bogus offset.
+static int readOffset(int previous) {
+  int v[4];
+  for (int i = 0; i < 4; i++) {
+    v[i] = lgGpioRead(chip, ENC_PINS[i]);
+    if (v[i] < 0)
+      return previous;
+  }
+  // ENC_PINS = {21, 20, 16, 12} -> bits 3, 2, 1, 0
+  return ~(v[0] << 3 | v[1] << 2 | v[2] << 1 | v[3] << 0) & 0x0f;
+}
+
 int main(void) {
-  int i, bit;
+  int i;
 
   union {
     struct {
@@ -25,7 +92,7 @@ int main(void) {
       uint32_t latchU3 : 1;
     } interface;
     uint32_t data;
-  } interfaceUnion;
+  } interfaceUnion = {.data = 0}; // zero all 32 bits, not just the 13 used
 
   interfaceUnion.interface.lower = 0;
   interfaceUnion.interface.upper = 0;
@@ -35,58 +102,73 @@ int main(void) {
   interfaceUnion.interface.hours = 0;
   interfaceUnion.interface.latchU3 = 0;
 
-  wiringPiSetupGpio();
+  // make sure the bitfield layout matches the SR_BIT_* positions we rely on
+  interfaceUnion.interface.blanking = 1;
+  if (interfaceUnion.data != (1u << SR_BIT_BLANKING)) {
+    printf("ERROR! bitfield layout mismatch (blanking) %s %i\n", __FILE__,
+           __LINE__);
+    return -1;
+  }
+  interfaceUnion.interface.blanking = 0;
+  interfaceUnion.interface.latchU3 = 1;
+  if (interfaceUnion.data != (1u << SR_BIT_LATCH_U3)) {
+    printf("ERROR! bitfield layout mismatch (latchU3) %s %i\n", __FILE__,
+           __LINE__);
+    return -1;
+  }
+  interfaceUnion.interface.latchU3 = 0;
 
-  // Pin base 100 for 32 pins.
-  //    Use Broadcom GPIO pins 10, 11 & 8 for data, clock and latch
-  sr595Setup(100, 32, 10, 11, 8);
-
-  // setup the encoder on the back
-  // pin 1 = gnd
-  // pins 2-5 = gpio 21,20,16,12
-
-  pinMode(21, INPUT);
-  pullUpDnControl(21, PUD_UP);
-  pinMode(20, INPUT);
-  pullUpDnControl(20, PUD_UP);
-  pinMode(16, INPUT);
-  pullUpDnControl(16, PUD_UP);
-  pinMode(12, INPUT);
-  pullUpDnControl(12, PUD_UP);
-
-  printf("RTC to derive True Time 60-DC display\n");
-  struct wiringPiNodeStruct *node =
-      wiringPiFindNode(100); // find our node so we can access our data!
-  if (node == NULL) {
-    printf("ERROR! no node found %s %i\n", __FILE__, __LINE__);
+  chip = lgGpiochipOpen(GPIOCHIP);
+  if (chip < 0) {
+    printf("ERROR! can't open gpiochip%d (%s) %s %i\n", GPIOCHIP,
+           lguErrorText(chip), __FILE__, __LINE__);
     return -1;
   }
 
+  // shift register outputs: data/clock low, latch idles high
+  if (lgGpioClaimOutput(chip, 0, SR_DATA, 0) < 0 ||
+      lgGpioClaimOutput(chip, 0, SR_CLOCK, 0) < 0 ||
+      lgGpioClaimOutput(chip, 0, SR_LATCH, 1) < 0) {
+    printf("ERROR! can't claim shift register pins %s %i\n", __FILE__,
+           __LINE__);
+    return -1;
+  }
 
-  int oldSl=-1, oldSh=-1; // used to detect a new led update period...
-  int locked; // set to zero when NTP is locked
+  // setup the encoder on the back (inputs with pull-ups)
+  for (i = 0; i < 4; i++) {
+    if (lgGpioClaimInput(chip, LG_SET_PULL_UP, ENC_PINS[i]) < 0) {
+      printf("ERROR! can't claim encoder gpio %d %s %i\n", ENC_PINS[i],
+             __FILE__, __LINE__);
+      return -1;
+    }
+  }
+
+  printf("RTC to derive True Time 60-DC display\n");
+
+
+  int oldSl = -1; // used to detect a new led update period...
+  int locked = 1; // set to zero when the clock is synchronised
+  int offset = 0; // hours offset from the back-panel encoder
 
   for (;;) {
     time_t now = time(NULL);
 
-    char t[26];
-    asctime_r(gmtime(&now), t);
+    struct tm utc;
+    gmtime_r(&now, &utc);
 
-    int hh = t[11] - '0', hl = t[12] - '0', mh = t[14] - '0', ml = t[15] - '0',
-        sh = t[17] - '0', sl = t[18] - '0';
+    int hh = utc.tm_hour / 10, hl = utc.tm_hour % 10, mh = utc.tm_min / 10,
+        ml = utc.tm_min % 10, sh = utc.tm_sec / 10, sl = utc.tm_sec % 10;
 
     //    printf ("%s h=%i%i m=%i%i s=%i%i\n",t,hh,hl,mh,ml,sh,sl);
 
     // get the offset
-    int offset = ~(digitalRead(21) << 3 | digitalRead(20) << 2 |
-                   digitalRead(16) << 1 | digitalRead(12) << 0) &
-                 0x0f;
+    offset = readOffset(offset);
     //    printf ("12=%i 16=%i 20=%i 21=%i
     //    ",digitalRead(12),digitalRead(16),digitalRead(20),digitalRead(21));
     //    printf ("offset=%i\n",offset);
     int hours = hh * 10 + hl - offset;
     //    printf ("hours1=%i\n",hours);
-    if (hours > 24) {
+    if (hours >= 24) {
       hours -= 24;
     } else if (hours < 0) {
       hours += 24;
@@ -103,43 +185,39 @@ int main(void) {
     interfaceUnion.interface.lower = sl;
     interfaceUnion.interface.upper = sh;
     interfaceUnion.interface.seconds = 1;
-    node->data3 = interfaceUnion.data;
-    digitalWrite(100 + 8, 1);
+    srOutput = interfaceUnion.data;
+    srWriteBit(SR_BIT_BLANKING, 1);
     interfaceUnion.interface.seconds = 0;
-    delayMicroseconds(DWELL);
-    digitalWrite(100 + 8, 0);
+    lguSleep(DWELL / 1e6);
+    srWriteBit(SR_BIT_BLANKING, 0);
 
     // send minutes
     interfaceUnion.interface.lower = ml;
     interfaceUnion.interface.upper = mh;
     interfaceUnion.interface.minutes = 1;
-    node->data3 = interfaceUnion.data;
-    digitalWrite(100 + 8, 1);
+    srOutput = interfaceUnion.data;
+    srWriteBit(SR_BIT_BLANKING, 1);
     interfaceUnion.interface.minutes = 0;
-    delayMicroseconds(DWELL);
-    digitalWrite(100 + 8, 0);
+    lguSleep(DWELL / 1e6);
+    srWriteBit(SR_BIT_BLANKING, 0);
 
     // send hours
     interfaceUnion.interface.lower = hl;
     interfaceUnion.interface.upper = hh;
     interfaceUnion.interface.hours = 1;
-    node->data3 = interfaceUnion.data;
-    digitalWrite(100 + 8, 1);
+    srOutput = interfaceUnion.data;
+    srWriteBit(SR_BIT_BLANKING, 1);
     interfaceUnion.interface.hours = 0;
-    delayMicroseconds(DWELL);
-    digitalWrite(100 + 8, 0);
+    lguSleep(DWELL / 1e6);
+    srWriteBit(SR_BIT_BLANKING, 0);
 
 
     // only do this once a second....
     if (oldSl!=sl) {
       oldSl=sl;
 
-      // only do this once every 10 seconds....
-      if (oldSh!=sh) {
-        oldSh=sh;
-        // get the status of NTP for the lock LED
-        locked=system("ntpstat 2>&1 > /dev/null");
-      }
+      // cheap syscall, so it is fine to check every second
+      locked = clockUnlocked();
 
       interfaceUnion.interface.upper = BLANKING;
 
@@ -153,9 +231,9 @@ int main(void) {
       }
 
       interfaceUnion.interface.lower = 0;
-      node->data3 = interfaceUnion.data;
-      digitalWrite(100 + 12, 1);
-      digitalWrite(100 + 12, 0); // toggle the e bit to load the latch
+      srOutput = interfaceUnion.data;
+      srWriteBit(SR_BIT_LATCH_U3, 1);
+      srWriteBit(SR_BIT_LATCH_U3, 0); // toggle the e bit to load the latch
       }
     }
   return 0;
