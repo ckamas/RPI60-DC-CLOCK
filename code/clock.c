@@ -1,4 +1,5 @@
 #include <lgpio.h>
+#include <signal.h>
 #include <stdio.h>
 
 #include <stdint.h>
@@ -10,6 +11,9 @@
 #define BLANKING 4
 #define DOTS 8
 #define LOCK 1
+
+// how long each digit pair stays strobed (microseconds)
+#define DWELL 5000
 
 #define GPIOCHIP 0 // /dev/gpiochip0 (the 40-pin header on all Pi models)
 
@@ -23,6 +27,9 @@
 // They must match the bitfield layout of interfaceUnion in main(); main()
 // verifies that at startup.
 #define SR_BIT_BLANKING 8  // == interface.blanking
+#define SR_BIT_SECONDS 9   // == interface.seconds
+#define SR_BIT_MINUTES 10  // == interface.minutes
+#define SR_BIT_HOURS 11    // == interface.hours
 #define SR_BIT_LATCH_U3 12 // == interface.latchU3
 
 // back-panel offset encoder: pin 1 = gnd, pins 2-5 = gpio 21,20,16,12
@@ -78,6 +85,34 @@ static int readOffset(int previous) {
   return ~(v[0] << 3 | v[1] << 2 | v[2] << 1 | v[3] << 0) & 0x0f;
 }
 
+static volatile sig_atomic_t stopRequested = 0;
+static void onSignal(int sig) {
+  (void)sig;
+  stopRequested = 1;
+}
+
+// Strobe all-zero data into one digit-pair latch, using the same
+// blanking-bit sequence as the normal refresh.
+static void loadZeros(int strobeBit) {
+  srOutput = 1u << strobeBit;
+  srWriteBit(SR_BIT_BLANKING, 1);
+  lguSleep(DWELL / 1e6);
+  srWriteBit(SR_BIT_BLANKING, 0);
+}
+
+// Called when we are asked to stop: put zeros in every latch (seconds,
+// minutes, hours, then the aux latch holding BLANKING/LOCK/DOTS) and leave the
+// pins at their idle levels (data/clock low, latch high).
+static void shutdownDisplay(void) {
+  loadZeros(SR_BIT_SECONDS);
+  loadZeros(SR_BIT_MINUTES);
+  loadZeros(SR_BIT_HOURS);
+  srOutput = 0;
+  srWriteBit(SR_BIT_LATCH_U3, 1); // aux latch loads on this bit's rising edge
+  srWriteBit(SR_BIT_LATCH_U3, 0);
+  srShift(); // all-zero image, latch idles high
+}
+
 int main(void) {
   int i;
 
@@ -103,20 +138,23 @@ int main(void) {
   interfaceUnion.interface.latchU3 = 0;
 
   // make sure the bitfield layout matches the SR_BIT_* positions we rely on
-  interfaceUnion.interface.blanking = 1;
-  if (interfaceUnion.data != (1u << SR_BIT_BLANKING)) {
-    printf("ERROR! bitfield layout mismatch (blanking) %s %i\n", __FILE__,
-           __LINE__);
-    return -1;
-  }
-  interfaceUnion.interface.blanking = 0;
-  interfaceUnion.interface.latchU3 = 1;
-  if (interfaceUnion.data != (1u << SR_BIT_LATCH_U3)) {
-    printf("ERROR! bitfield layout mismatch (latchU3) %s %i\n", __FILE__,
-           __LINE__);
-    return -1;
-  }
-  interfaceUnion.interface.latchU3 = 0;
+#define CHECK_BIT(field, pos)                                                  \
+  do {                                                                         \
+    interfaceUnion.data = 0;                                                   \
+    interfaceUnion.interface.field = 1;                                        \
+    if (interfaceUnion.data != (1u << (pos))) {                                \
+      printf("ERROR! bitfield layout mismatch (" #field ") %s %i\n",           \
+             __FILE__, __LINE__);                                              \
+      return -1;                                                               \
+    }                                                                          \
+  } while (0)
+  CHECK_BIT(blanking, SR_BIT_BLANKING);
+  CHECK_BIT(seconds, SR_BIT_SECONDS);
+  CHECK_BIT(minutes, SR_BIT_MINUTES);
+  CHECK_BIT(hours, SR_BIT_HOURS);
+  CHECK_BIT(latchU3, SR_BIT_LATCH_U3);
+#undef CHECK_BIT
+  interfaceUnion.data = 0;
 
   chip = lgGpiochipOpen(GPIOCHIP);
   if (chip < 0) {
@@ -150,7 +188,14 @@ int main(void) {
   int locked = 1; // set to zero when the clock is synchronised
   int offset = 0; // hours offset from the back-panel encoder
 
-  for (;;) {
+  // exit cleanly on systemctl stop/restart, reboot or ctrl-c
+  struct sigaction sa = {0};
+  sa.sa_handler = onSignal; // no SA_RESTART: interrupt sleeps promptly
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
+
+  while (!stopRequested) {
     time_t now = time(NULL);
 
     struct tm utc;
@@ -179,7 +224,12 @@ int main(void) {
     hh = hours / 10;
 
     //    printf ("%s h=%i%i m=%i%i s=%i%i\n",t,hh,hl,mh,ml,sh,sl);
-#define DWELL 5000
+    // Each field is sent as: load the shift register image with this field's
+    // strobe bit set, push it with the blanking bit up for DWELL, then push it
+    // again with blanking down.  The "interface.<field> = 0" after each push
+    // clears OUR copy so the next field's image doesn't carry this strobe
+    // (the image already pushed keeps its strobe until the next field loads).
+    // Don't remove them: all three strobes would then pile up.
 
     // send seconds
     interfaceUnion.interface.lower = sl;
@@ -236,5 +286,8 @@ int main(void) {
       srWriteBit(SR_BIT_LATCH_U3, 0); // toggle the e bit to load the latch
       }
     }
+
+  shutdownDisplay();
+  lgGpiochipClose(chip);
   return 0;
 }
